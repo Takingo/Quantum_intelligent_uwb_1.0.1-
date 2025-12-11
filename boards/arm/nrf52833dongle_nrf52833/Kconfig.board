@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_NRF52833DONGLE_NRF52833
+	bool "nRF52833 Dongle (K4W UWB Tag)"
+	depends on SOC_NRF52833_QDAA

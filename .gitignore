@@ -1,0 +1,32 @@
+# Zephyr Build Artifacts
+build/
+*.hex
+*.bin
+*.elf
+*.map
+*.lst
+zephyr.dts
+zephyr.stat
+
+# nRF Tools
+*.jlink
+*.log
+build_log.txt
+
+# IDE
+.vscode/
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+*.tmp
+*.bak
+*.swp
+*~

@@ -1,0 +1,16 @@
+description: Decawave DW3000 UWB Transceiver
+
+compatible: "decawave,dw3000"
+
+include: spi-device.yaml
+
+properties:
+  reset-gpios:
+    type: phandle-array
+    required: true
+  irq-gpios:
+    type: phandle-array
+    required: false
+  cs-gpios:
+    type: phandle-array
+    required: true

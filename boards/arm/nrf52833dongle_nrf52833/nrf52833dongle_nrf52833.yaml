@@ -1,0 +1,21 @@
+identifier: nrf52833dongle_nrf52833
+name: nRF52833 Dongle (K4W UWB Tag)
+type: mcu
+arch: arm
+toolchain:
+  - zephyr
+  - gnuarmemb
+  - xtools
+ram: 128
+flash: 512
+supported:
+  - adc
+  - counter
+  - gpio
+  - i2c
+  - nvs
+  - pwm
+  - spi
+  - usb_device
+  - watchdog
+  - netif:openthread

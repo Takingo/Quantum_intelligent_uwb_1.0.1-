@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+
+if BOARD_NRF52833DONGLE_NRF52833
+
+config BOARD
+	default "nrf52833dongle_nrf52833"
+
+endif # BOARD_NRF52833DONGLE_NRF52833

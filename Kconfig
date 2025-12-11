@@ -1,0 +1,11 @@
+mainmenu "UWB TAG FIRMWARE Configuration"
+
+config BOARD
+	string "Board"
+	default "nrf52833dk_nrf52833"
+
+config APP_VERSION
+	string "Application version"
+	default "1.0.0"
+
+source "Kconfig.zephyr"
