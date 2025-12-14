@@ -18,7 +18,34 @@ static const struct gpio_dt_spec cs_gpio = GPIO_DT_SPEC_GET(DW3000_NODE, cs_gpio
 /* Forward declaration of UWB driver functions */
 extern int uwb_driver_init(void);
 extern int uwb_send_blink(void);
+extern int uwb_twr_cycle(void);
+extern int uwb_rx_test_mode(void);
+extern int uwb_beacon_tx_mode(void); // TX beacon test
 extern void reset_DWIC(void);
+
+/* Global LED control for UWB driver */
+static bool g_led_available = false;
+static const struct gpio_dt_spec *g_led_ptr = NULL;
+
+void uwb_led_on(void) {
+    if (g_led_available && g_led_ptr) {
+        gpio_pin_set_dt(g_led_ptr, 1);
+    }
+}
+
+void uwb_led_off(void) {
+    if (g_led_available && g_led_ptr) {
+        gpio_pin_set_dt(g_led_ptr, 0);
+    }
+}
+
+void uwb_led_pulse(void) {
+    if (g_led_available && g_led_ptr) {
+        gpio_pin_set_dt(g_led_ptr, 1);
+        k_msleep(50);
+        gpio_pin_set_dt(g_led_ptr, 0);
+    }
+}
 
 void gpio_scan_disco(void) {
     printk("\n--- STARTING GPIO DISCO SCAN ---\n");
@@ -126,24 +153,21 @@ int main(void)
 
     /* Initialize LED */
     printk("Checking LED device...\n");
+    g_led_ptr = &led;
     if (!gpio_is_ready_dt(&led)) {
         printk("ERROR: LED device not ready!\n");
     } else {
         printk("LED device ready, configuring...\n");
-        ret = gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
+        ret = gpio_pin_configure_dt(&led, GPIO_OUTPUT);
         if (ret != 0) {
             printk("ERROR: Failed to configure LED: %d\n", ret);
         } else {
-            printk("LED configured successfully! Blinking...\n");
-            led_available = true;
+            /* LED OFF by default - will pulse during frame transmission */
+            gpio_pin_set_dt(&led, 0);
             
-            /* Blink LED 3 times to show we're alive */
-            for (int i = 0; i < 3; i++) {
-                gpio_pin_set_dt(&led, 1);
-                k_msleep(100);
-                gpio_pin_set_dt(&led, 0);
-                k_msleep(100);
-            }
+            printk("LED configured - will blink only during frame TX\n");
+            led_available = true;
+            g_led_available = true;
         }
     }
 
@@ -178,40 +202,34 @@ int main(void)
     }
 
     printk("UWB Driver initialized successfully!\n");
-    printk("Entering TX transmission loop...\n");
-    printk("Transmission interval: 500ms\n");
-    printk("===========================================\n\n");
+    printk("╔═══════════════════════════════════════╗\n");
+    printk("║  📏 TWR RANGING MODE - NEW TAG 📏    ║\n");
+    printk("║  Measuring distance with Anchor      ║\n");
+    printk("║  Interval: 1 second                  ║\n");
+    printk("╚═══════════════════════════════════════╝\n\n");
     
-    LOG_INF("UWB Driver initialized successfully");
-    LOG_INF("Entering TX transmission loop - 500ms interval");
+    LOG_INF("=== TWR RANGING MODE ===");
+    LOG_INF("Starting TWR cycles...");
     k_msleep(500);
 
-    /* Main TX loop - Send BLINK frame every 500ms */
+    /* Main TWR loop */
     while (1) {
         frame_count++;
         
-        /* Send UWB BLINK frame (TX operation) */
-        if (frame_count % 10 == 1) {
-            printk(">>> FRAME #%u: Sending BLINK...\n", frame_count);
-        }
-        LOG_INF(">>> FRAME #%u: Sending BLINK...", frame_count);
+        printk("\n╔═════════════════════════════════════╗\n");
+        printk("║   TWR CYCLE #%03u - NEW TAG        ║\n", frame_count);
+        printk("╚═════════════════════════════════════╝\n");
         
-        ret = uwb_send_blink();
+        ret = uwb_twr_cycle();
         if (ret) {
-            printk("ERROR: Failed to send BLINK frame: %d\n", ret);
-            LOG_ERR("Failed to send BLINK frame: %d", ret);
+            printk("❌ TWR cycle #%u failed!\n", frame_count);
+            LOG_ERR("TWR cycle #%u failed", frame_count);
+        } else {
+            printk("✅ TWR cycle #%u complete!\n", frame_count);
         }
         
-        /* Blink LED every 2 frames (once per second at 500ms interval) */
-        if (led_available && (frame_count % 2 == 0)) {
-            gpio_pin_set_dt(&led, 1);  // LED ON
-            k_msleep(100);
-            gpio_pin_set_dt(&led, 0);  // LED OFF
-        }
-
-        /* Sleep for 500ms before next transmission */
-        k_msleep(500);
+        k_msleep(50);  // 50ms delay - 20Hz update rate
     }
-
+    
     return 0;
 }
