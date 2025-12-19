@@ -6,7 +6,25 @@
 
 LOG_MODULE_REGISTER(uwb_tag_firmware, CONFIG_LOG_DEFAULT_LEVEL);
 
+#ifndef UWB_CAL_ENABLE
+#define UWB_CAL_ENABLE 0
+#endif
+
+#ifndef UWB_CAL_REF_MM
+#define UWB_CAL_REF_MM 5000
+#endif
+
+#ifndef UWB_CAL_SAMPLES
+#define UWB_CAL_SAMPLES 100
+#endif
+
 /* LED0 for nRF52833 Dongle */
+// User requested "Front LED". On nRF52833 Dongle:
+// LED0 (Green) = P0.06
+// LED1 (RGB) = Red P0.08, Green P1.09, Blue P0.12
+// Trying LED1 Green (P1.09) as the "Front" indicator if LED0 was wrong.
+// Or if LED0 was P0.06 and that was "back", maybe P0.13 is front?
+// Let's try standard LED0 first, but ensure it's P0.06.
 #define LED0_NODE DT_ALIAS(led0)
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 
@@ -21,6 +39,7 @@ extern int uwb_send_blink(void);
 extern int uwb_twr_cycle(void);
 extern int uwb_rx_test_mode(void);
 extern int uwb_beacon_tx_mode(void); // TX beacon test
+extern int uwb_calibrate_antenna_delay(uint32_t ref_mm, uint16_t samples);
 extern void reset_DWIC(void);
 
 /* Global LED control for UWB driver */
@@ -40,11 +59,17 @@ void uwb_led_off(void) {
 }
 
 void uwb_led_pulse(void) {
+    // LED DISABLED to prevent battery voltage drop (brownout)
+    return;
+    
+    /*
     if (g_led_available && g_led_ptr) {
         gpio_pin_set_dt(g_led_ptr, 1);
-        k_msleep(50);
+        // Short blink (5ms) to minimize blocking but remain visible
+        k_busy_wait(5000);
         gpio_pin_set_dt(g_led_ptr, 0);
     }
+    */
 }
 
 void gpio_scan_disco(void) {
@@ -140,8 +165,18 @@ int main(void)
     uint32_t frame_count = 0;
     bool led_available = false;
 
+#ifndef TAG_TWR_PERIOD_MS
+// Requirement: TAG must keep transmitting periodically and must not "go to sleep".
+// Use a stable period so an anchor can always rediscover the tag when it comes back in range.
+// INCREASED to 1000ms to reduce log spam and allow easier debugging.
+#define TAG_TWR_PERIOD_MS 1000
+#endif
+
     /* Wait for RTT to connect */
     k_msleep(2000);
+
+    // Run Disco Scan to identify LED pin visually
+    gpio_scan_disco();
 
     printk("\n\n");
     printk("===========================================\n");
@@ -201,34 +236,54 @@ int main(void)
         }
     }
 
+#if UWB_CAL_ENABLE
+    printk("\n===========================================\n");
+    printk("Calibration mode: DS-TWR antenna delay\n");
+    printk("Ref: %u mm, Samples: %u\n", (unsigned)UWB_CAL_REF_MM, (unsigned)UWB_CAL_SAMPLES);
+    (void)uwb_calibrate_antenna_delay((uint32_t)UWB_CAL_REF_MM, (uint16_t)UWB_CAL_SAMPLES);
+    printk("Calibration done. Continuing ranging...\n");
+#endif
+
     printk("UWB Driver initialized successfully!\n");
-    printk("╔═══════════════════════════════════════╗\n");
-    printk("║  📏 TWR RANGING MODE - NEW TAG 📏    ║\n");
-    printk("║  Measuring distance with Anchor      ║\n");
-    printk("║  Interval: 1 second                  ║\n");
-    printk("╚═══════════════════════════════════════╝\n\n");
-    
-    LOG_INF("=== TWR RANGING MODE ===");
-    LOG_INF("Starting TWR cycles...");
+    printk("TWR ranging mode: periodic TX every %d ms\n", TAG_TWR_PERIOD_MS);
     k_msleep(500);
 
     /* Main TWR loop */
+    int fail_count = 0;
     while (1) {
+        int64_t t_start = k_uptime_get();
         frame_count++;
-        
-        printk("\n╔═════════════════════════════════════╗\n");
-        printk("║   TWR CYCLE #%03u - NEW TAG        ║\n", frame_count);
-        printk("╚═════════════════════════════════════╝\n");
-        
+
+        // Ensure LED is OFF between transmissions; pulses are handled inside TX paths.
+        uwb_led_off();
+
         ret = uwb_twr_cycle();
         if (ret) {
-            printk("❌ TWR cycle #%u failed!\n", frame_count);
-            LOG_ERR("TWR cycle #%u failed", frame_count);
+            // Keep the loop running regardless of failures.
+            // Avoid spamming RTT when disconnected; errors still show if enabled.
+            LOG_WRN("TWR cycle #%u failed", frame_count);
+            fail_count++;
+            
+            // Watchdog: If we fail 10 times in a row, re-initialize the radio.
+            // This fixes issues where the DW3000 gets stuck in a weird state on battery power.
+            if (fail_count >= 10) {
+                LOG_ERR("Too many failures! Re-initializing UWB driver...");
+                uwb_driver_init();
+                fail_count = 0;
+                k_msleep(100);
+            }
         } else {
-            printk("✅ TWR cycle #%u complete!\n", frame_count);
+            LOG_DBG("TWR cycle #%u complete", frame_count);
+            fail_count = 0; // Reset counter on success
         }
-        
-        k_msleep(50);  // 50ms delay - 20Hz update rate
+
+        // Stable 2s cadence (or TAG_TWR_PERIOD_MS) regardless of anchor presence.
+        int64_t elapsed = k_uptime_get() - t_start;
+        int32_t sleep_ms = (int32_t)TAG_TWR_PERIOD_MS - (int32_t)elapsed;
+        if (sleep_ms < 0) {
+            sleep_ms = 0;
+        }
+        k_msleep(sleep_ms);
     }
     
     return 0;

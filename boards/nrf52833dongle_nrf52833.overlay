@@ -58,7 +58,7 @@
     leds {
         compatible = "gpio-leds";
         led0_custom: led_0_custom {
-            gpios = <&gpio0 5 GPIO_ACTIVE_LOW>;
+            gpios = <&gpio0 5 GPIO_ACTIVE_HIGH>;
             label = "Front Green LED";
         };
     };

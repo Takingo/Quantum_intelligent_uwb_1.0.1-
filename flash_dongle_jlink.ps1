@@ -1,12 +1,21 @@
 #!/usr/bin/env pwsh
 # UWB Tag Firmware - JLink Flash Script for nRF52833 Dongle
-# Usage: .\flash_dongle_jlink.ps1
+# Usage:
+#   .\flash_dongle_jlink.ps1
+#   .\flash_dongle_jlink.ps1 -Snr <JLINK_SNR>
+
+param(
+    [string]$Snr
+)
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "=======================================" -ForegroundColor Cyan
 Write-Host "UWB Tag - JLink Flash (nRF52833 Dongle)" -ForegroundColor Cyan
 Write-Host "=======================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "NOTE: This method requires an SWD debugger (J-Link) connected to the dongle." -ForegroundColor Yellow
+Write-Host "If you are only using the dongle over USB with no debugger, use a DFU/bootloader-based method instead." -ForegroundColor Yellow
 Write-Host ""
 
 # Check if build directory exists
@@ -72,9 +81,22 @@ try {
     
     Write-Host "Using JLink: $jlinkExe" -ForegroundColor Green
     Write-Host ""
+
+    if ($Snr) {
+        Write-Host "Using debugger SNR: $Snr" -ForegroundColor Green
+        Write-Host ""
+    } else {
+        Write-Host "NOTE: No debugger SNR specified; JLink will use the first connected probe." -ForegroundColor Yellow
+        Write-Host "If you have multiple probes, pass -Snr <id> (matches the number from 'nrfjprog -i')." -ForegroundColor Yellow
+        Write-Host ""
+    }
     
     # Run JLink
-    & $jlinkExe -CommanderScript $jlinkScriptFile
+    if ($Snr) {
+        & $jlinkExe -SelectEmuBySN $Snr -CommanderScript $jlinkScriptFile
+    } else {
+        & $jlinkExe -CommanderScript $jlinkScriptFile
+    }
     
     Write-Host ""
     Write-Host "=======================================" -ForegroundColor Green

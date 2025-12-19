@@ -52,7 +52,9 @@
 #define DWT_SUCCESS (0)
 #define DWT_ERROR   (-1)
 
-#define DWT_TIME_UNITS      (1.0/499.2e6/128.0) //!< = 15.65e-12 s
+#ifndef DWT_TIME_UNITS
+#define DWT_TIME_UNITS      (1.0/(499.2e6*128.0)) /* ~= 15.65e-12 s */
+#endif
 
 #define DWT_A0_DEV_ID       (0xDECA0300)        //!< DW3000 MPW A0 (non PDOA) silicon device ID
 #define DWT_A0_PDOA_DEV_ID  (0xDECA0310)        //!< DW3000 MPW A0 (with PDOA) silicon device ID

@@ -21,15 +21,46 @@ static dwt_txconfig_t txconfig = {
 };
 static uint8_t seq_num = 0;
 
+// ================= Calibration (compile-time) =================
+// Set to 1 to run antenna-delay calibration from application code.
+#ifndef UWB_CAL_ENABLE
+#define UWB_CAL_ENABLE 0
+#endif
+
+#ifndef UWB_CAL_REF_MM
+#define UWB_CAL_REF_MM 5000
+#endif
+
+#ifndef UWB_CAL_SAMPLES
+#define UWB_CAL_SAMPLES 100
+#endif
+
+// Reduced antenna delay to fix negative ToF (Ra < Db)
+// Previous: 15800 gave ~2.0m at 0.1m.
+// 16600 gave negative result (Ra < Db).
+// Trying 16000 to get back to positive range (approx 1.0m expected).
+static uint16_t g_antenna_delay = 16000;
+
 /* TWR Frame Types */
 #define FUNC_CODE_POLL   0x61
 #define FUNC_CODE_RESP   0x50
-#define FUNC_CODE_FINAL  0x69
+#define FUNC_CODE_FINAL  0x23
+
+/* Optional: ANCHOR -> TAG report with computed distance */
+#define FUNC_CODE_REPORT 0x44
 
 /* TWR Timestamps (40-bit) */
 static uint64_t poll_tx_ts = 0;
 static uint64_t resp_rx_ts = 0;
 static uint64_t final_tx_ts = 0;
+
+// Forward declarations (avoid implicit extern declarations before static defs)
+static int uwb_wait_report(uint32_t *dist_mm_out);
+
+// Public APIs defined later in this file
+int uwb_send_poll(void);
+int uwb_wait_resp(void);
+int uwb_send_final(void);
 
 /* Speed of light in air, in metres per microsecond */
 #define SPEED_OF_LIGHT 299702547.0
@@ -153,16 +184,28 @@ int uwb_driver_init(void) {
     }
     LOG_INF("PLL LOCK OK!");
     
-    // Step 10: Configure TX power (MAXIMUM for better range)
-    LOG_INF("Step 10: Setting TX power to MAX...");
-    txconfig.power = 0xFEFEFEFE; // Maximum power
+    // Step 10: Configure TX power (LOW for battery stability)
+    LOG_INF("Step 10: Setting TX power to LOW (0x10101010)...");
+    // Battery Stability Fix:
+    // High power (0x1F...) causes voltage drop -> Brownout -> Corrupted Timestamps.
+    // Low power (0x10...) prevents brownout, allowing valid timestamps.
+    txconfig.power = 0x10101010; 
     dwt_configuretxrf(&txconfig);
     
     // Step 11: Set antenna delays
     LOG_INF("Step 11: Setting antenna delays...");
-    dwt_setrxantennadelay(16385); // RX antenna delay
-    dwt_settxantennadelay(16385); // TX antenna delay
+    // Calibration Target: 1000mm (1 meter).
+    // Previous: 16360 gave ~300mm (at 1000mm) -> Error -700mm.
+    // To INCREASE distance by 700mm, we DECREASE delay.
+    // 700mm / 4.69mm/DTU ~= 149 DTU.
+    // New Target: 16360 - 149 = 16211. Rounded to 16210.
+    g_antenna_delay = 16210;
+    dwt_setrxantennadelay(g_antenna_delay); // RX antenna delay
+    dwt_settxantennadelay(g_antenna_delay); // TX antenna delay
     
+    // Disable frame filtering to accept all frames
+    dwt_configureframefilter(DWT_FF_DISABLE, 0);
+
     // Step 12: Configure RX after TX delay and timeout (CRITICAL for TWR!)
     LOG_INF("Step 12: Configuring RX after TX...");
     dwt_setrxaftertxdelay(0);    // 0us delay - START RX IMMEDIATELY!
@@ -178,6 +221,119 @@ int uwb_driver_init(void) {
     dwt_configureframefilter(DWT_FF_DISABLE, 0);
     
     LOG_INF("=== UWB Driver Initialization Complete ===");
+    return 0;
+}
+
+static int uwb_measure_report_mm(uint32_t *report_mm_out) {
+    if (report_mm_out) {
+        *report_mm_out = 0;
+    }
+
+    // Step 1: Send POLL
+    if (uwb_send_poll() != 0) {
+        return -1;
+    }
+
+    k_msleep(5);
+
+    // Step 2: Wait RESP
+    if (uwb_wait_resp() != 0) {
+        return -1;
+    }
+
+    // Step 3: Send FINAL
+    if (uwb_send_final() != 0) {
+        return -1;
+    }
+
+    // Step 4: Wait REPORT (anchor DS result)
+    uint32_t report_mm = 0;
+    if (uwb_wait_report(&report_mm) != 0 || report_mm == 0) {
+        return -1;
+    }
+
+    if (report_mm_out) {
+        *report_mm_out = report_mm;
+    }
+    return 0;
+}
+
+int uwb_calibrate_antenna_delay(uint32_t ref_mm, uint16_t samples) {
+    if (samples == 0) {
+        return -1;
+    }
+
+    LOG_INF("\n=== ANTENNA DELAY CALIBRATION ===");
+    LOG_INF("Ref distance: %u mm, samples: %u", ref_mm, samples);
+    LOG_INF("Start delay: %u", g_antenna_delay);
+
+    // Collect samples
+    // NOTE: Keep memory small (no full sorting). We'll do a two-pass mean + outlier reject.
+    double mean_mm = 0.0;
+    uint32_t ok_count = 0;
+    for (uint16_t i = 0; i < samples; i++) {
+        uint32_t report_mm = 0;
+        if (uwb_measure_report_mm(&report_mm) == 0) {
+            ok_count++;
+            mean_mm += (double)report_mm;
+        }
+        k_msleep(10);
+    }
+
+    if (ok_count < (uint32_t)(samples / 2)) {
+        LOG_ERR("Calibration failed: too few valid REPORTs (%u/%u)", ok_count, samples);
+        return -1;
+    }
+
+    mean_mm /= (double)ok_count;
+
+    // Second pass: re-measure and keep within +/-20% of initial mean
+    const double low = mean_mm * 0.80;
+    const double high = mean_mm * 1.20;
+    double mean2_mm = 0.0;
+    uint32_t ok2 = 0;
+    uint32_t rejected = 0;
+    for (uint16_t i = 0; i < samples; i++) {
+        uint32_t report_mm = 0;
+        if (uwb_measure_report_mm(&report_mm) == 0) {
+            if ((double)report_mm >= low && (double)report_mm <= high) {
+                ok2++;
+                mean2_mm += (double)report_mm;
+            } else {
+                rejected++;
+            }
+        }
+        k_msleep(10);
+    }
+
+    if (ok2 < (uint32_t)(samples / 2)) {
+        LOG_ERR("Calibration failed: too many outliers (kept %u/%u)", ok2, samples);
+        return -1;
+    }
+
+    mean2_mm /= (double)ok2;
+    LOG_INF("Measured mean: %.1f mm (kept %u, rejected %u)", mean2_mm, ok2, rejected);
+
+    const double measured_m = mean2_mm / 1000.0;
+    const double ref_m = (double)ref_mm / 1000.0;
+    const double error_m = measured_m - ref_m;
+
+    // Convert distance error (m) -> DTU (device time units)
+    const double dwt_time_unit_s = (1.0 / (499.2e6 * 128.0));
+    const double error_dtu = error_m / (SPEED_OF_LIGHT * dwt_time_unit_s);
+
+    const double new_delay_f = (double)g_antenna_delay - (error_dtu / 2.0);
+    uint16_t new_delay = (uint16_t)((new_delay_f < 0.0) ? 0.0 : (new_delay_f > 65535.0 ? 65535.0 : (new_delay_f + 0.5)));
+
+    LOG_INF("Error: %+0.3f m -> %+0.1f DTU", error_m, error_dtu);
+    LOG_INF("Suggested new antenna delay: %u (old %u)", new_delay, g_antenna_delay);
+
+    // Apply immediately (both RX and TX)
+    g_antenna_delay = new_delay;
+    dwt_setrxantennadelay(g_antenna_delay);
+    dwt_settxantennadelay(g_antenna_delay);
+    LOG_INF("Applied antenna delay: %u", g_antenna_delay);
+
     return 0;
 }
 
@@ -264,6 +420,7 @@ int uwb_send_poll(void) {
     dwt_writetxfctrl(sizeof(tx_poll_msg) + 2, 0, 1); // ranging=1
     
     // *** AUTO RX ENABLE - DW3000 starts RX automatically after TX! ***
+    // Reverted to DWT_RESPONSE_EXPECTED for standard TWR behavior
     dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
     
     uwb_led_pulse();
@@ -288,7 +445,60 @@ int uwb_send_poll(void) {
 /* TWR: Step 2 - Receive RESP frame with ANCHOR timestamps */
 static uint64_t poll_rx_ts_anchor = 0;  // ANCHOR's POLL RX timestamp
 static uint64_t resp_tx_ts_anchor = 0;  // ANCHOR's RESP TX timestamp
-static uint32_t calculated_dist_mm = 0; // Calculated distance to send to Anchor
+static uint32_t calculated_dist_mm = 0; // Best-available distance (mm)
+
+static int uwb_wait_report(uint32_t *dist_mm_out) {
+    if (dist_mm_out) {
+        *dist_mm_out = 0;
+    }
+
+    uint32_t status;
+    uint8_t rx_buffer[64];
+    uint16_t frame_len;
+
+    // Clear status and enable RX immediately
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_TX | SYS_STATUS_ALL_RX_GOOD | SYS_STATUS_ALL_RX_ERR);
+    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+    // Keep this bounded so the tag never "stalls" a cycle when anchor is absent.
+    // REPORT is optional; a short wait is enough when it exists.
+    for (int i = 0; i < 200; i++) {
+        status = dwt_read32bitreg(SYS_STATUS_ID);
+
+        if (status & SYS_STATUS_RXFCG_BIT_MASK) {
+            frame_len = dwt_read32bitreg(RX_FINFO_ID) & 0x3FF;
+            if (frame_len > 0 && frame_len <= sizeof(rx_buffer)) {
+                dwt_readrxdata(rx_buffer, frame_len, 0);
+
+                // MsgType at index 9 (same as other frames)
+                if (frame_len >= 14 && rx_buffer[9] == FUNC_CODE_REPORT) {
+                    uint32_t dist_mm = 0;
+                    dist_mm |= (uint32_t)rx_buffer[10];
+                    dist_mm |= ((uint32_t)rx_buffer[11]) << 8;
+                    dist_mm |= ((uint32_t)rx_buffer[12]) << 16;
+                    dist_mm |= ((uint32_t)rx_buffer[13]) << 24;
+
+                    if (dist_mm_out) {
+                        *dist_mm_out = dist_mm;
+                    }
+                    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_GOOD | SYS_STATUS_ALL_RX_ERR);
+                    return 0;
+                }
+            }
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_GOOD | SYS_STATUS_ALL_RX_ERR);
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        }
+
+        if (status & SYS_STATUS_ALL_RX_ERR) {
+            dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        }
+
+        k_msleep(1);
+    }
+
+    return -1;
+}
 
 int uwb_wait_resp(void) {
     uint32_t status;
@@ -296,10 +506,13 @@ int uwb_wait_resp(void) {
     uint16_t frame_len;
     int status_check_count = 0;
     
-    LOG_INF("⏳ Waiting for RESPONSE (3sec timeout)...");
-    
-    // Wait for RX complete or error (max 3000ms)
-    for (int i = 0; i < 3000; i++) {
+    LOG_DBG("Waiting for RESPONSE (bounded timeout)...");
+
+    // NOTE: RX is already enabled by DWT_RESPONSE_EXPECTED in uwb_send_poll()
+
+    // Bounded wait so main loop can keep periodic TX.
+    // Increased timeout to ensure we catch the frame even if timing is loose.
+    for (int i = 0; i < 2000; i++) { // Increased to 2000 iterations (approx 200ms)
         status = dwt_read32bitreg(SYS_STATUS_ID);
         status_check_count++;
         
@@ -314,7 +527,9 @@ int uwb_wait_resp(void) {
                 // FC(2) + Seq(1) + PAN(2) + Dest(2) + Src(2) + MsgType(1) + Payload...
                 // MsgType at index 9 should be 0x50 (RESP)
                 
-                if (frame_len >= 20 && rx_buffer[9] == 0x50) {
+                if (frame_len >= 20 && rx_buffer[9] == FUNC_CODE_RESP) {
+                    
+                    // REMOVED: uwb_led_pulse(); // Don't block here!
                     
                     // Get TAG's RESP RX timestamp
                     resp_rx_ts = get_rx_timestamp_u64();
@@ -332,46 +547,26 @@ int uwb_wait_resp(void) {
                     }
                     
                     LOG_INF("⏱️  TAG: POLL_TX=0x%010llX, RESP_RX=0x%010llX", poll_tx_ts, resp_rx_ts);
-                    LOG_INF("⏱️  ANCHOR: POLL_RX=0x%010llX, RESP_TX=0x%010llX", 
-                            poll_rx_ts_anchor, resp_tx_ts_anchor);
                     
-                    // --- CALCULATE DISTANCE (SS-TWR) ---
-                    int64_t Ra, Db;
-                    double tof, dist;
-                    
-                    // Ra = RESP_RX - POLL_TX
-                    if (resp_rx_ts >= poll_tx_ts) Ra = resp_rx_ts - poll_tx_ts;
-                    else Ra = (0x10000000000ULL - poll_tx_ts) + resp_rx_ts;
-                    
-                    // Db = RESP_TX - POLL_RX
-                    if (resp_tx_ts_anchor >= poll_rx_ts_anchor) Db = resp_tx_ts_anchor - poll_rx_ts_anchor;
-                    else Db = (0x10000000000ULL - poll_rx_ts_anchor) + resp_tx_ts_anchor;
-                    
-                    tof = ((double)Ra - (double)Db) / 2.0;
-                    if (tof < 0) tof = 0;
-                    
-                    // Distance = ToF * Speed of Light
-                    // 1 DU = 15.65e-12 s, Speed = 299792458 m/s
-                    dist = tof * 15.65e-12 * 299792458.0;
-                    calculated_dist_mm = (uint32_t)(dist * 1000.0); // Convert to mm
-                    
-                    LOG_INF("📏 Calculated Distance: %d mm", calculated_dist_mm);
-                    
+                    // Clear status and return success immediately
                     dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_GOOD | SYS_STATUS_ALL_RX_ERR);
-                    LOG_INF("✅ RESP received!");
                     return 0;
                 } else {
+                    // Not a RESP frame, clear and re-enable RX
                     dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_GOOD);
+                    dwt_rxenable(DWT_START_RX_IMMEDIATE);
                 }
             }
         }
         
-        // RX errors - clear and continue
+        // RX errors - clear and RE-ENABLE RX
         if (status & SYS_STATUS_ALL_RX_ERR) {
+            LOG_WRN("⚠️ RX Error: 0x%08X", status);
             dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
+            dwt_rxenable(DWT_START_RX_IMMEDIATE);
         }
         
-        k_msleep(1);
+        k_busy_wait(100); // 100us wait instead of 1ms sleep for tighter loop
     }
     
     LOG_ERR("❌ RESP timeout");
@@ -383,41 +578,74 @@ int uwb_wait_resp(void) {
 int uwb_send_final(void) {
     uint32_t status;
     int timeout = 0;
-    
-    /* FINAL Frame: FC(2) + Seq(1) + PAN(2) + Dest(2) + Src(2) + MsgType(1) + 
-     *              DISTANCE_MM(4) = 14 bytes
+
+    // Use delayed TX so FINAL_TX timestamp is known before sending.
+    // IMPORTANT: Scheduling FINAL relative to RESP_RX can become "late" if there is
+    // any logging/RTOS jitter between RESP RX and programming DX_TIME.
+    // To make FINAL reliable, schedule it relative to *current* device system time,
+    // and embed that exact scheduled FINAL_TX in the payload.
+    // DS-TWR still works because Da = (FINAL_TX - RESP_RX) simply reflects the real delay.
+    // 1 us ~= 63898 DTU
+    // Give generous margin so delayed-TX programming + SPI writes never miss the scheduled slot.
+    // This directly improves reliability of FINAL reception on the anchor.
+    // INCREASED to 100ms to ensure Anchor has finished printing to Serial (approx 26ms) and enabled RX.
+    const uint64_t FINAL_DLY_DTU = 100000ULL * 63898ULL; // 100ms
+    const uint64_t sys_time_40 = ((uint64_t)dwt_readsystimestamphi32()) << 8; // bits[39:8] -> align low 8
+
+    // IMPORTANT (timestamp domain): RX/TX timestamps used for DS-TWR must be in the same domain.
+    // With DW3000, the actual TX timestamp corresponds to the on-air time (affected by TX antenna delay).
+    // Because FINAL is sent via delayed TX, we embed the expected on-air TX timestamp as:
+    //   FINAL_TX(on-air) = DX_TIME(scheduled) + TX_ANTENNA_DELAY
+    // Anchor must do the same for its RESP_TX timestamp.
+    const uint64_t final_tx_scheduled = (sys_time_40 + (FINAL_DLY_DTU & 0xFFFFFFFF00ULL)) & 0xFFFFFFFFFFULL;
+    final_tx_ts = (final_tx_scheduled + (uint64_t)g_antenna_delay) & 0xFFFFFFFFFFULL;
+
+    /* FINAL Frame (timestamp payload):
+     * FC(2) + Seq(1) + PAN(2) + Dest(2) + Src(2) + MsgType(1) +
+     * POLL_TX(5) + RESP_RX(5) + FINAL_TX(5) = 25 bytes
      */
-    uint8_t final_frame[14] = {
+    uint8_t final_frame[25] = {
         0x41, 0x88,           // [0-1] Frame Control
         0,                    // [2] Sequence
         0xCA, 0xDE,           // [3-4] PAN ID
         0x02, 0x00,           // [5-6] Destination (ANCHOR ID = 0x0002)
         0x01, 0x00,           // [7-8] Source (TAG ID = 0x0001)
         0x23,                 // [9] Msg Type: FINAL (0x23)
-        0, 0, 0, 0            // [10-13] Distance in mm (uint32_t)
+        0, 0, 0, 0, 0,        // [10-14] POLL_TX (40-bit)
+        0, 0, 0, 0, 0,        // [15-19] RESP_RX (40-bit)
+        0, 0, 0, 0, 0         // [20-24] FINAL_TX (40-bit)
     };
     
     final_frame[2] = seq_num++;
-    
-    LOG_INF("🔹 Sending FINAL frame with Distance: %d mm", calculated_dist_mm);
-    
-    // Embed distance (Little Endian)
-    final_frame[10] = calculated_dist_mm & 0xFF;
-    final_frame[11] = (calculated_dist_mm >> 8) & 0xFF;
-    final_frame[12] = (calculated_dist_mm >> 16) & 0xFF;
-    final_frame[13] = (calculated_dist_mm >> 24) & 0xFF;
+
+    // Embed timestamps (Little Endian, 40-bit)
+    for (int i = 0; i < 5; i++) {
+        final_frame[10 + i] = (poll_tx_ts >> (8 * i)) & 0xFF;
+        final_frame[15 + i] = (resp_rx_ts >> (8 * i)) & 0xFF;
+        final_frame[20 + i] = (final_tx_ts >> (8 * i)) & 0xFF;
+    }
     
     dwt_forcetrxoff();
     k_busy_wait(10);
+
+    // Clear status flags before scheduling TX
+    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_TX | SYS_STATUS_ALL_RX_GOOD | SYS_STATUS_ALL_RX_ERR);
+
+    // Program delayed TX absolute time (bits [39:8]) using the scheduled time (without antenna delay)
+    dwt_setdelayedtrxtime((uint32_t)(final_tx_scheduled >> 8));
     
     dwt_writetxdata(sizeof(final_frame), final_frame, 0);
     dwt_writetxfctrl(sizeof(final_frame) + 2, 0, 1); // +2 FCS, ranging=1
-    
-    // Immediate TX
-    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
-        LOG_ERR("FINAL TX failed!");
+
+    // Delayed TX at DX_TIME
+    if (dwt_starttx(DWT_START_TX_DELAYED) != DWT_SUCCESS) {
+        const uint32_t st_lo = dwt_read32bitreg(SYS_STATUS_ID);
+        const uint32_t st_hi = dwt_read32bitreg(SYS_STATUS_HI_ID);
+        LOG_ERR("FINAL TX start failed (SYS_STATUS=0x%08X, SYS_STATUS_HI=0x%08X)", st_lo, st_hi);
         return -1;
     }
+
+    LOG_INF("🔹 Sending FINAL frame (timestamps). SS-est dist: %d mm", calculated_dist_mm);
     
     uwb_led_pulse(); // LED pulse when sending FINAL
     
@@ -474,7 +702,11 @@ static double calculate_distance(void) {
     // TWR Formula: ToF = (Ra - Db) / 2
     tof = ((double)Ra - (double)Db) / 2.0;
     
-    LOG_INF("  ToF (calculated): %.2f DU (%.3f ns)", tof, tof * 15.65);
+    // NOTE: Zephyr LOG/CBPRINTF often has float formatting disabled.
+    // Keep logs integer-only so RTT output remains readable.
+    const int64_t tof_du_i = (int64_t)((tof >= 0.0) ? (tof + 0.5) : (tof - 0.5));
+    const int64_t tof_ns_i = (int64_t)((tof * 15.65) >= 0.0 ? ((tof * 15.65) + 0.5) : ((tof * 15.65) - 0.5));
+    LOG_INF("  ToF (calculated): %lld DU (~%lld ns)", tof_du_i, tof_ns_i);
     
     // Sanity checks
     if (tof < 0) {
@@ -488,8 +720,10 @@ static double calculate_distance(void) {
     // Distance = ToF × Speed of Light
     distance = tof_sec * SPEED_OF_LIGHT;
     
-    LOG_INF("  ⏱️  ToF: %.6f microseconds", tof_sec * 1e6);
-    LOG_INF("  📏 Distance: %.3f meters (%.1f cm)", distance, distance * 100.0);
+    const int64_t tof_us_i = (int64_t)((tof_sec * 1e6) >= 0.0 ? ((tof_sec * 1e6) + 0.5) : ((tof_sec * 1e6) - 0.5));
+    const uint32_t dist_mm_i = (distance <= 0.0) ? 0U : (uint32_t)((distance * 1000.0) + 0.5);
+    LOG_INF("  ⏱️  ToF: ~%lld us", tof_us_i);
+    LOG_INF("  📏 Distance: %u mm", dist_mm_i);
     
     return distance;
 }
@@ -510,7 +744,7 @@ int uwb_twr_cycle(void) {
         return -1;
     }
     
-    k_msleep(5); // Small delay
+    // k_msleep(5); // REMOVED: Do not sleep! Anchor replies in 2ms.
     
     // Step 2: Wait for RESP
     if (uwb_wait_resp() != 0) {
@@ -518,12 +752,18 @@ int uwb_twr_cycle(void) {
         return -1;
     }
     
-    k_msleep(5); // Small delay before FINAL
-    
     // Step 3: Send FINAL with TAG timestamps to ANCHOR
     if (uwb_send_final() != 0) {
         LOG_ERR("❌ FINAL send failed");
         return -1;
+    }
+
+    // Step 3b: Optional REPORT (anchor-computed DS-TWR distance)
+    uint32_t report_dist_mm = 0;
+    if (uwb_wait_report(&report_dist_mm) == 0 && report_dist_mm > 0) {
+        LOG_INF("📩 REPORT received: %u mm (anchor DS-TWR)", report_dist_mm);
+    } else {
+        LOG_WRN("(no REPORT) anchor may not support DS-TWR report yet");
     }
     
     // Step 4: Calculate distance at TAG (we have all timestamps now)
@@ -534,7 +774,8 @@ int uwb_twr_cycle(void) {
     
     double distance = calculate_distance();
     if (distance > 0) {
-        LOG_INF("✅ TWR SUCCESS: %.3f m (%.1f cm)", distance, distance * 100.0);
+        const uint32_t dist_mm = (uint32_t)((distance * 1000.0) + 0.5);
+        LOG_INF("✅ TWR SUCCESS: %u mm", dist_mm);
     } else {
         LOG_WRN("⚠️ Distance calculation failed (invalid timestamps)");
     }

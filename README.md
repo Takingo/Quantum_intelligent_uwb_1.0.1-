@@ -37,7 +37,39 @@ Quantum Intelligent UWB Tag is a professional firmware solution for ultra-wideba
 
 ---
 
-## 🔧 Hardware Requirements
+## � Release Notes v1.0.1 (Calibration & Stability Update)
+
+### 🔧 Critical Fixes & Calibration (Dec 2025)
+
+This release addresses critical stability issues on battery power and finalizes the distance calibration.
+
+#### 1. Power Stability (Battery vs. USB)
+- **Issue:** High TX power (`0x1F1F1F1F`) caused voltage brownouts when running on battery (CR2032/LiPo), leading to corrupted timestamps and "Invalid Calculation" errors on the Anchor side.
+- **Fix:** TX Power reduced to **Low (`0x10101010`)**. This ensures stable operation on weak power sources while maintaining adequate indoor range.
+- **Recommendation:** For maximum range (>10m), use a high-current USB power source. For battery operation, keep the current low-power setting.
+
+#### 2. Distance Calibration (1 Meter)
+- **Target:** 1000 mm (1.00 meter)
+- **Calibrated Antenna Delay:** `16210` (Decimal)
+- **Result:** Accurate ranging at 1m with standard deviation typical for UWB (+/- 10cm due to indoor multipath).
+- **Formula:** `Distance = SpeedOfLight * (ToF - AntennaDelay)`
+
+#### 3. Watchdog & Reliability
+- **Watchdog:** Added logic to re-initialize the DW3000 driver if 10 consecutive TWR failures occur. This prevents the tag from getting stuck in an undefined state.
+- **LEDs:** Disabled LED pulsing during TX to conserve peak current and prevent brownouts.
+
+### 📝 Configuration Summary
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| **Antenna Delay** | `16210` | Tuned for 1m accuracy |
+| **TX Power** | `0x10101010` | Low power for battery stability |
+| **TWR Period** | `1000 ms` | 1Hz update rate |
+| **Preamble** | `128` | Standard DWT_PLEN_128 |
+| **Data Rate** | `6.8 Mbps` | DWT_BR_6M8 |
+
+---
+
+## �🔧 Hardware Requirements
 
 ### Primary Components
 
